@@ -199,3 +199,23 @@ contributors to cluster-wide tail latency.
     7. Distributed coordination can therefore sit directly on the
        request's latency critical path.  
 
+## Stage 2 Mental Model  
+1. An epoch is a time-bounded XCN allocation window.  
+2. An XCN contains:
+       epoch/time bits
+       +
+       13-bit transaction sequence.  
+3. Lower 13 bits = 0 means epoch boundary.  
+4. Lower 13 bits 1..8191 identify transactions
+   within that epoch.  
+5. Therefore each epoch supports at most 8191
+   transaction XCNs.  
+6. Transactions within the same epoch still have a
+   fine-grained ordering through their sequence numbers.  
+7. If sequence space is exhausted, committers must
+   wait for another epoch.  
+8. Epochs therefore provide both:
+       grouping/batching
+       +
+       ordered transaction identity.  
+
