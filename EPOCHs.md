@@ -644,5 +644,945 @@ Therefore, useful performance questions include:
        "What progress condition is the request waiting for before it
         becomes safe to release?"  
 
+# Stage 4 — Single-Node Epoch Lifecycle  
+## Core Idea  
+Within a single node, a transaction can move through several distinct states:
+
+    logical version assigned
+        |
+        v
+    locally committed / durable
+        |
+        v
+    committed but not yet visible
+        |
+        v
+    visibility frontier advances
+        |
+        v
+    visible / releasable
+
+The important point is:
+
+    Assigned != Committed != Visible != Released
+
+These are different stages of progress.  
+
+## Example
+
+Suppose a logical epoch begins with:
+
+    SafeVisibilityFrontier   = 5000
+    CommitAssignmentFrontier = 5000
+
+Transaction T1 begins committing and receives:
+
+    T1 -> 5001
+
+After its local durability work completes:
+
+    T1 version = 5001
+    SafeVisibilityFrontier = 5000
+
+Since:
+
+    5001 > 5000
+
+T1 is:
+
+    COMMITTED
+    but
+    NOT YET VISIBLE
+
+A transaction can therefore be durable without yet being exposed to new
+readers.  
+
+## Multiple Transactions Can Accumulate
+
+While the visibility frontier remains fixed, additional transactions may
+commit:
+
+    T1 -> 5001
+    T2 -> 5002
+    T3 -> 5003
+
+Conceptually:
+
+    5000 | 5001 5002 5003
+         |   T1   T2   T3
+         |
+         +--- safe visibility frontier
+
+T1, T2, and T3 may all be locally committed while still remaining ahead of
+the visibility frontier.
+
+This creates a batching window.  
+
+## Epoch Advance
+
+Eventually, the system advances to a new logical epoch.
+
+Suppose the new visibility frontier becomes:
+
+    6000
+
+Now:
+
+    T1 = 5001
+    T2 = 5002
+    T3 = 5003
+
+all satisfy:
+
+    transaction_version <= SafeVisibilityFrontier
+
+Therefore, the transactions can become visible together as a batch.
+
+Conceptually:
+
+    Before epoch advance:
+
+        visibility frontier = 5000
+
+        5000 | 5001 5002 5003
+             |   T1   T2   T3
+
+
+    After epoch advance:
+
+        visibility frontier = 6000
+
+        5001 5002 5003 ........ 6000
+         T1   T2   T3             |
+                                  |
+                           new visibility frontier
+
+The epoch transition therefore acts as a batch visibility event.  
+
+## Why Batch Visibility?
+
+If the system advanced visibility independently for every transaction:
+
+    T1 commits -> advance visibility
+    T2 commits -> advance visibility
+    T3 commits -> advance visibility
+
+it could repeatedly pay synchronization, coordination, and wake-up costs.
+
+Instead, multiple transactions can accumulate and become visible together:
+
+    T1
+    T2
+    T3
+     |
+     v
+    one epoch advance
+     |
+     v
+    all become visible
+
+This amortizes synchronization overhead across many transactions.
+
+The tradeoff is:
+
+    better batching / throughput efficiency
+
+versus:
+
+    additional waiting latency for individual transactions
+
+This is a classic throughput-vs-latency tradeoff.  
+
+## Visibility-Wait Latency
+
+Transactions that commit early in an epoch generally wait longer for the
+next visibility advance than transactions that commit near the epoch
+boundary.
+
+Example:
+
+    Epoch N
+    |------------------------------------------|
+     T1                              T3       advance
+      |                               |          |
+      |<------- longer wait --------->|          |
+                                      |<-short->|
+
+T1 experiences more visibility-wait latency because it committed earlier.
+
+Under a simplified fixed-period model, if transactions arrive uniformly
+throughout an epoch of duration:
+
+    T_epoch
+
+then the average visibility wait is approximately:
+
+    E[Wait] ~= T_epoch / 2
+
+Transactions arriving immediately after an epoch boundary may wait close to:
+
+    T_epoch
+
+while transactions arriving just before the next boundary may wait almost
+nothing.
+
+This is a useful performance intuition rather than a universal implementation
+rule.  
+
+## Latency Decomposition
+
+A transaction's end-to-end latency can include several distinct components:
+
+    T_total
+        =
+    T_version_assignment
+        +
+    T_local_commit
+        +
+    T_visibility_wait
+        +
+    T_release
+
+For example:
+
+    local commit          = 1 ms
+    visibility wait       = 4.5 ms
+    release overhead      = 0.1 ms
+
+The storage or durability work may therefore represent only a small portion
+of total latency.
+
+This is why performance analysis should decompose the request into logical phases rather than treating all non-compute time as generic overhead.  
+
+## Performance Engineering Questions
+
+Useful questions include:
+
+- How long do transactions spend waiting after local commit?
+- How frequently does the visibility frontier advance?
+- How many transactions are released per visibility event?
+- How much batching benefit is gained?
+- How much additional latency does batching introduce?
+- Is end-to-end latency dominated by local commit work or visibility waiting?
+- How does epoch duration affect average and tail latency?  
+
+## Stage 4 Key Invariants
+
+1. A transaction can be locally committed but not yet visible.
+
+2. Logical version assignment, durability, visibility, and release are
+   distinct stages.
+
+3. Multiple committed transactions can accumulate behind a fixed visibility
+   frontier.
+
+4. A later epoch advance can move the visibility frontier and make the batch
+   visible together.
+
+5. The batching mechanism amortizes synchronization overhead.
+
+6. Early transactions in an epoch typically wait longer than transactions
+   that commit near the epoch boundary.
+
+7. The design trades throughput efficiency against additional visibility-wait
+   latency.
+
+8. For performance analysis, always separate:
+
+       local work
+
+   from:
+
+       coordination / visibility waiting  
+
+# Stage 5 — Distributed Epoch Coordination  
+## Core Idea
+
+In a multi-node distributed system, advancing a local visibility frontier is
+not enough to establish that the entire cluster has advanced.
+
+A node may know:
+
+    "I have reached Epoch N+1"
+
+without knowing:
+
+    "Every other node has also reached Epoch N+1"
+
+Therefore, distributed visibility requires a coordination protocol that lets
+nodes reason about cluster-wide progress.
+
+## Coordinator-Based Epoch Advancement
+
+A common model is:
+
+    Epoch Coordinator
+       |
+       +----> Node A
+       +----> Node B
+       +----> Node C
+
+The coordinator broadcasts an epoch:
+
+    E101
+
+Each node processes the epoch and acknowledges it:
+
+    Node A -> ACK(E101)
+    Node B -> ACK(E101)
+    Node C -> ACK(E101)
+
+The coordinator does not advance to the next epoch until all required
+participants have acknowledged the current one.
+
+Conceptually:
+
+    broadcast E101
+        |
+        v
+    wait for all ACK(E101)
+        |
+        v
+    broadcast E102
+
+This creates a distributed synchronization barrier.
+
+---
+
+## Local Knowledge vs Global Knowledge
+
+Suppose:
+
+    Node A has received E101
+    Node B has received E101
+    Node C is still at E100
+
+Node A knows:
+
+    "I have reached E101"
+
+but Node A cannot yet conclude:
+
+    "The entire cluster has reached E101"
+
+Therefore:
+
+    Local progress != Knowledge of global progress
+
+This distinction is fundamental in distributed systems.
+
+---
+
+## Why a Later Epoch Proves Something About the Previous One
+
+Assume the protocol rule is:
+
+    The coordinator may issue E102
+    only after all nodes acknowledge E101.
+
+Then if Node A later receives:
+
+    E102
+
+Node A can infer:
+
+    Every required node previously acknowledged E101.
+
+Therefore:
+
+    receive(E102)
+        =>
+    all nodes have reached at least E101
+
+More generally:
+
+    receive(E[N+1])
+        =>
+    all participants acknowledged E[N]
+
+The important point is that the meaning of the later epoch does not come
+from the number itself.
+
+It comes from the protocol rule governing when that epoch may be issued.
+
+Therefore:
+
+    Later epoch
+        =
+    evidence about global completion of the previous epoch
+
+---
+
+## Epoch Advancement as a Distributed Barrier
+
+The protocol behaves similarly to a barrier synchronization primitive.
+
+Conceptually:
+
+    Node A ACK ----\
+    Node B ACK ----- > coordinator may advance
+    Node C ACK ----/
+
+The cluster cannot cross the barrier until all required participants have
+arrived.
+
+This means an epoch is not merely a monotonically increasing counter.
+
+It represents a distributed progress point.
+
+A better mental model is:
+
+    Epoch Coordinator
+        !=
+    simple counter generator
+
+Instead:
+
+    Epoch Coordinator
+        =
+    distributed progress-barrier coordinator
+
+---
+
+## Slowest-Participant Effect
+
+Suppose acknowledgement latency is:
+
+    Node A = 1 ms
+    Node B = 2 ms
+    Node C = 20 ms
+
+If the coordinator requires acknowledgements from all three nodes, then the
+barrier cannot complete before Node C responds.
+
+Conceptually:
+
+    T_barrier ~= max(T_A, T_B, T_C)
+
+So:
+
+    T_barrier ~= 20 ms
+
+This is an important distributed-systems performance property:
+
+    global progress can be determined by the slowest participant
+
+rather than by average node latency.
+
+---
+
+## Sources of Epoch Delay
+
+A node may delay the distributed barrier because of:
+
+- network latency
+- CPU saturation
+- runtime pauses
+- storage stalls
+- scheduler delays
+- overload
+- temporary node-health problems
+
+A single delayed participant can therefore increase cluster-wide progress
+latency.
+
+This is especially important for tail-latency analysis.
+
+---
+
+## Knowledge Hierarchy
+
+It is useful to distinguish three levels of knowledge.
+
+### Level 1 — Local State
+
+    Node A has processed E101.
+
+This says nothing by itself about Node B or Node C.
+
+### Level 2 — Coordinator State
+
+    The coordinator has received ACK(E101)
+    from all required participants.
+
+The coordinator now knows the cluster has crossed E101.
+
+### Level 3 — Derived Distributed Knowledge
+
+Once Node A receives E102:
+
+    Node A can infer that all required nodes reached E101.
+
+The later coordinator message allows Node A to learn indirectly about
+cluster-wide progress.
+
+---
+
+## Connection to Visibility
+
+Suppose Node A has locally completed some transaction work.
+
+Node A may know:
+
+    local commit complete
+    local visibility advanced
+
+but still need evidence that other nodes have advanced sufficiently before
+making a strong cross-node guarantee.
+
+The epoch barrier provides a mechanism for establishing that evidence.
+
+This is the bridge between:
+
+    local completion
+
+and:
+
+    distributed safety
+
+---
+
+## Performance Engineering View
+
+When epoch advancement stalls, the useful question is not simply:
+
+    "Why didn't the epoch increment?"
+
+Instead ask:
+
+    "Which participant is preventing the distributed barrier from completing?"
+
+Useful metrics include:
+
+- per-node epoch lag
+- per-node acknowledgement latency
+- time waiting for all acknowledgements
+- slowest-node contribution
+- epoch advancement interval
+- number and duration of epoch stalls
+
+A useful conceptual model is:
+
+    T_epoch_advance
+        ~=
+    max(per-node acknowledgement latency)
+        +
+    coordinator overhead
+
+The `max()` term is often the most important one.
+
+---
+
+## Stage 5 Key Invariants
+
+1. A node reaching an epoch does not imply that every other node has reached
+   the same epoch.
+
+2. Local progress and knowledge of global progress are different concepts.
+
+3. A coordinator can require acknowledgements from all participants before
+   advancing the epoch.
+
+4. Under such a protocol:
+
+       receive(E[N+1])
+           =>
+       all required participants acknowledged E[N]
+
+5. The later epoch therefore acts as evidence about completion of the
+   previous epoch.
+
+6. Epoch advancement can be viewed as a repeated distributed barrier.
+
+7. Barrier latency is often determined by the slowest participant.
+
+8. Distributed coordination can therefore become a major contributor to
+   tail latency and request critical paths. 
+
+# Stage 6 — Why Writers Wait Two Epoch Advances but Readers Wait One
+
+## Core Idea
+
+The key distinction is:
+
+    Being at epoch E_N
+        !=
+    Being able to see commits that occurred during E_N
+
+Commits made during epoch E_N become visible only when the system advances
+to E_N+1.
+
+This is because the visibility frontier remains pinned at the start of E_N
+while transactions accumulate inside that epoch.
+
+Conceptually:
+
+    E_N opens
+        |
+        +-- T1 commits
+        +-- T2 commits
+        +-- T3 commits
+        |
+        |  commits are collected inside E_N
+        |
+    E_N+1 opens
+        |
+        +-- commits from E_N become visible
+
+So:
+
+    E_N      = collection window
+    E_N+1    = publication point for E_N's commits
+
+This invariant is what creates the difference between reader and writer
+wait semantics.
+
+---
+
+## Reader Case
+
+Suppose a reader observes a snapshot at:
+
+    E_N
+
+The reader wants to ensure that a later read routed to another node cannot
+return a state older than E_N.
+
+Therefore the reader needs proof that:
+
+    all nodes have reached at least E_N
+
+Under the epoch coordination protocol:
+
+    receive E_N+1
+        =>
+    all nodes acknowledged E_N
+
+Therefore:
+
+    Reader at E_N
+        |
+        v
+    needs all nodes >= E_N
+        |
+        v
+    E_N+1 provides that proof
+        |
+        v
+    safe to return
+
+So the reader requires:
+
+    1 epoch advance
+
+Conceptually:
+
+    Reader snapshot = E_N
+    Proof arrives   = E_N+1
+
+---
+
+## Writer Case
+
+Now suppose a transaction commits during:
+
+    E_N
+
+The write is different from the reader because the transaction's commit is
+not visible merely when nodes are at E_N.
+
+The transaction was created inside E_N.
+
+It becomes visible only when the visibility frontier advances to:
+
+    E_N+1
+
+Therefore, for the writer to be globally safe, it needs:
+
+    all nodes to reach E_N+1
+
+Only then can every node see the commits that occurred during E_N.
+
+But how does Node A know that all nodes reached E_N+1?
+
+Using the same epoch coordination invariant:
+
+    receive E_N+2
+        =>
+    all nodes acknowledged E_N+1
+
+Therefore:
+
+    Writer commits during E_N
+        |
+        v
+    commit becomes visible at E_N+1
+        |
+        v
+    need all nodes to reach E_N+1
+        |
+        v
+    E_N+2 provides proof
+        |
+        v
+    safe to release / acknowledge
+
+So the writer requires:
+
+    2 epoch advances
+
+Conceptually:
+
+    Commit epoch    = E_N
+    Visibility      = E_N+1
+    Global proof    = E_N+2
+
+---
+
+## Reader vs Writer
+
+The asymmetry can be summarized as:
+
+    Reader at snapshot E_N:
+        needs all nodes >= E_N
+        proof arrives with E_N+1
+        => 1 advance
+
+    Writer committed during E_N:
+        needs all nodes >= E_N+1
+        because E_N commits become visible at E_N+1
+        proof arrives with E_N+2
+        => 2 advances
+
+The writer is one step further out because it creates new state inside the
+current epoch.
+
+The reader is validating an already-existing visibility point.
+
+---
+
+## Why E_N Commits Are Not Visible During E_N
+
+During an epoch, the visibility frontier remains at the epoch boundary while
+transactions receive newer logical versions inside the epoch.
+
+Example:
+
+    visibility frontier = 5000
+
+    T1 = 5001
+    T2 = 5002
+    T3 = 5003
+
+Conceptually:
+
+    5000 | 5001 5002 5003
+         |   T1   T2   T3
+         |
+         +--- visibility frontier
+
+T1, T2, and T3 are ahead of the visibility frontier.
+
+When the next epoch opens:
+
+    visibility frontier -> 6000
+
+then:
+
+    5001, 5002, 5003 <= 6000
+
+and all prior-epoch commits become visible together.
+
+Therefore:
+
+    epoch E_N
+        =
+    batching / collection window
+
+and:
+
+    transition to E_N+1
+        =
+    publication event for E_N's commits
+
+---
+
+## Distributed Proof Rule
+
+The distributed coordination rule is:
+
+    coordinator sends E_N+1
+    only after all required nodes acknowledge E_N
+
+Therefore:
+
+    receive(E_N+1)
+        =>
+    all required nodes reached E_N
+
+This lets nodes infer global progress indirectly.
+
+Applying it twice gives the writer rule:
+
+    receive(E_N+2)
+        =>
+    all nodes reached E_N+1
+        =>
+    all nodes can see commits made during E_N
+
+---
+
+## Concrete Example
+
+Suppose transaction T1 commits during:
+
+    E100
+
+Then:
+
+    E100
+      |
+      +-- T1 commits
+      |
+      v
+    E101
+
+At E101:
+
+    T1 becomes visible locally as the visibility frontier advances.
+
+But Node A still needs proof that every node reached E101.
+
+That proof arrives when:
+
+    E102
+
+is issued.
+
+So:
+
+    T1 commits in E100
+        |
+        v
+    E101 makes E100 commits visible
+        |
+        v
+    all nodes ACK E101
+        |
+        v
+    E102 is issued
+        |
+        v
+    Node A knows every node can see T1
+        |
+        v
+    safe ACK
+
+---
+
+## Why a Reader Needs Less Waiting
+
+Suppose a reader observes snapshot:
+
+    E100
+
+The reader does not need every node to see commits made during E100.
+
+It only needs every node to have reached:
+
+    E100
+
+That proof arrives when:
+
+    E101
+
+is issued.
+
+So:
+
+    reader at E100
+        |
+        v
+    E101 proves all nodes reached E100
+        |
+        v
+    safe return
+
+This is why:
+
+    reader = 1 epoch advance
+
+while:
+
+    writer = 2 epoch advances
+
+---
+
+## Performance Engineering View
+
+The two-epoch writer wait is not arbitrary overhead.
+
+It reflects two logical requirements:
+
+    1. Move the visibility frontier far enough to include the write.
+    2. Prove that this new visibility point propagated across the cluster.
+
+Therefore writer latency can include:
+
+    local commit work
+        +
+    wait for publication boundary
+        +
+    wait for distributed propagation proof
+
+A useful conceptual model is:
+
+    T_write
+        ~=
+    T_local_commit
+        +
+    T_visibility_wait
+        +
+    T_global_propagation_wait
+
+The final component may be dominated by the slowest participant in the
+cluster.
+
+This means a write-latency spike can be caused by another node's delay,
+even when the writer's local storage path is healthy.
+
+---
+
+## Stage 6 Key Invariants
+
+1. Commits made during E_N are not visible during E_N.
+
+2. E_N+1 acts as the publication point for commits made inside E_N.
+
+3. A reader at E_N only needs proof that every node reached E_N.
+
+4. That proof arrives with E_N+1.
+
+5. Therefore a reader waits 1 epoch advance.
+
+6. A writer committing during E_N needs every node to reach E_N+1,
+   because that is when E_N's commits become visible.
+
+7. Proof that every node reached E_N+1 arrives with E_N+2.
+
+8. Therefore a writer waits 2 epoch advances.
+
+9. The asymmetry exists because:
+
+       Reader:
+           validates an existing visibility point
+
+       Writer:
+           creates new state that must first become visible,
+           then globally proven visible
+
+10. From a performance perspective, writer latency may include both
+    publication wait and distributed-propagation wait.  
+
 
 
