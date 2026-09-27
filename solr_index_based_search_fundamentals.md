@@ -1683,12 +1683,6 @@ query across multiple segments
 periodically merge segments
 ```
 
-The key architectural insight is:
-$
-[
-\boxed{
-\text{Immutable sorted segments transform costly random mutation into sequential construction and efficient merging}
-}
-$
-This preserves sorted postings while supporting continuous indexing and efficient querying.  
+The key architectural insight is:  
+*Immutable sorted segments transform costly random mutation into sequential construction and efficient merging. This preserves sorted postings while supporting continuous indexing and efficient querying.*   
 
