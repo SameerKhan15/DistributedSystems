@@ -462,7 +462,252 @@ term → sorted DocIDs
 
 ---
 
-## 10. Why Are Postings Sorted?
+## 10. Postings can contain richer metadata
+
+A posting does not have to contain only:
+
+```text id="6o5byc"
+term → DocID
+```
+
+It can also record information about **how the term occurs inside the document**.
+
+Conceptually, a posting may contain:
+
+```text id="shxwkw"
+DocID
+term frequency
+positions
+offsets
+```
+
+Consider:
+
+```text id="g5m8w4"
+D1 = "sameer khan sameer"
+```
+
+After tokenization:
+
+```text id="8r0pzc"
+position 0 → sameer
+position 1 → khan
+position 2 → sameer
+```
+
+The posting for `sameer` could therefore be represented conceptually as:
+
+```text id="jdfowb"
+sameer:
+  DocID      = 1
+  frequency  = 2
+  positions  = [0, 2]
+```
+
+#### Term frequency
+
+```text id="pxh7x6"
+frequency = 2
+```
+
+means that `sameer` occurs twice in this document.
+
+This information can participate in scoring and other query processing.
+
+---
+
+#### Positions
+
+A **position** identifies where a token appears in the analyzed token stream.
+
+For:
+
+```text id="2nlyc7"
+sameer khan sameer
+```
+
+the token stream is:
+
+```text id="9wzkwj"
+0: sameer
+1: khan
+2: sameer
+```
+
+Therefore:
+
+```text id="9g94ka"
+sameer → positions [0, 2]
+khan   → position  [1]
+```
+
+Positions allow the search engine to reason about relationships between terms.
+
+For example, consider the phrase query:
+
+```text id="enrxmw"
+"sameer khan"
+```
+
+The engine can compare positions.
+
+For the first occurrence:
+
+```text id="8b7t9e"
+sameer @ 0
+khan   @ 1
+```
+
+and verify:
+
+\[
+pos(khan)=pos(sameer)+1
+\]
+
+Therefore the phrase occurs.
+
+By contrast, if the document were:
+
+```text id="zxg3uq"
+sameer john khan
+```
+
+the positions would be:
+
+```text id="gkwf7i"
+sameer @ 0
+john   @ 1
+khan   @ 2
+```
+
+Now:
+
+\[
+pos(khan)\neq pos(sameer)+1
+\]
+
+so the exact phrase:
+
+```text id="scgbo9"
+"sameer khan"
+```
+
+does not occur.
+
+This means phrase search can often be resolved using indexed positional information instead of rescanning the original document text.
+
+---
+
+#### Offsets
+
+Offsets describe **character locations** in the original analyzed text rather than token ordinal positions.
+
+For:
+
+```text id="ddf46m"
+sameer khan sameer
+```
+
+the character layout is approximately:
+
+```text id="afyxks"
+sameer khan sameer
+012345678901234567
+```
+
+Conceptually:
+
+```text id="xwwe4w"
+sameer #1 → startOffset=0,  endOffset=6
+khan      → startOffset=7,  endOffset=11
+sameer #2 → startOffset=12, endOffset=18
+```
+
+Offsets therefore answer a different question from positions.
+
+Positions answer:
+
+> Which token number is this?
+
+Offsets answer:
+
+> Which character range in the original text produced this token?
+
+A useful distinction is:
+
+```text id="rzqvax"
+positions → token-space coordinates
+offsets   → character-space coordinates
+```
+
+---
+
+#### Why keep both?
+
+Positions are especially useful for:
+
+```text id="hp6h6w"
+phrase queries
+proximity queries
+ordered-token relationships
+positional n-gram verification
+```
+
+Offsets are especially useful for:
+
+```text id="xrcbx1"
+highlighting matched text
+mapping tokens back to source text
+character-level span reconstruction
+```
+
+For example, after finding a match for `sameer`, offsets can tell the application which exact characters should be highlighted.
+
+---
+
+#### This becomes important again with n-grams
+
+Later, if:
+
+```text id="k1p5k4"
+sameer
+```
+
+is converted into trigrams:
+
+```text id="ndsqzo"
+sam
+ame
+mee
+eer
+```
+
+simply finding all four grams in the same document may produce false positives.
+
+Position or offset information can help verify that the grams occur in the correct overlapping sequence:
+
+```text id="45dg2h"
+sam → starts at 0
+ame → starts at 1
+mee → starts at 2
+eer → starts at 3
+```
+
+which reconstructs:
+
+```text id="k14cg7"
+sameer
+```
+
+So richer postings let an inverted index answer not only:
+
+> Which documents contain this term?
+
+but also:
+
+> Where, how often, and in what relationship to other terms does it occur?  
+
+## 11. Why Are Postings Sorted?
 
 Suppose:
 
@@ -512,7 +757,7 @@ Lucene contains additional optimizations, but sorted postings are the essential 
 
 ---
 
-## 11. Larger Toy Example
+## 12. Larger Toy Example
 
 Assume:
 
@@ -566,7 +811,7 @@ df(sameer) = 4
 
 ---
 
-## 12. Core Mental Model
+## 13. Core Mental Model
 
 For the exact query:
 
@@ -615,7 +860,7 @@ follow postings
 
 ---
 
-## 13. The Most Important Distinction
+## 14. The Most Important Distinction
 
 Exact search contains two logically separate problems:
 
@@ -686,7 +931,7 @@ What changes dramatically is **term discovery**.
 
 ---
 
-## 14. Stage 1 Takeaways
+## 15. Stage 1 Takeaways
 
 ### Inverted index
 
