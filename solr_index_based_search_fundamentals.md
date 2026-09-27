@@ -1649,20 +1649,8 @@ storage bandwidth
 cache pressure
 ```
 
-Therefore the index has a fundamental systems tradeoff:
-
-\[
-\boxed{
-\text{indexing throughput}
-\leftrightarrow
-\text{merge cost}
-\leftrightarrow
-\text{segment count}
-\leftrightarrow
-\text{query latency}
-}
-\]
-
+Therefore the index has a fundamental systems tradeoff:  
+`indexing throughput <-> merge cost <-> segment count <-> query latency`  
 ---
 
 ## Core Mental Model
