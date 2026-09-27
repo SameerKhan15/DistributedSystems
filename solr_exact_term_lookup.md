@@ -1256,11 +1256,7 @@ local DocIDs = 0,1,2,3
 
 A global query-time DocID can be viewed as:
 
-\[
-globalDocID
-=
-docBase + localDocID
-\]
+globalDocID = docBase + localDocID  
 
 For example:
 
@@ -1337,27 +1333,10 @@ Conceptual combined result:
 ## Query Cost with Multiple Segments
 
 For a single simplified inverted index, the exact-term lookup cost was:
-
-\[
-T_{query}
-\approx
-T_{termLookup}
-+
-T_{postings}
-\]
+`T_query = T_termlookup + T_postings`  
 
 With multiple segments:
-
-\[
-T_{query}
-\approx
-\sum_{s=1}^{S}
-\left(
-T_{termLookup,s}
-+
-T_{postings,s}
-\right)
-\]
+T_query ≈ Σ(s=1 to S) (T_termLookup,s + T_postings,s)
 
 where:
 
